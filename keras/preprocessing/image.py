@@ -12,50 +12,112 @@ import math
 from six.moves import range
 import threading
 
+from math import cos, sin, radians
+
 '''Fairly basic set of tools for realtime data augmentation on image data.
 Can easily be extended to include new transformations, new preprocessing methods, etc...
 '''
 
+def coordinatesToLearnAreStillInScope(coordinates, abscissaScale, ordinateScale, margin):
 
-def random_rotation(x, rg, fill_mode="nearest", cval=0.):
+    #get extremum points coordinates
+    _abcissa_max = coordinates[np.argmax(coordinates[:, 0])]
+    _ordinate_max = coordinates[np.argmax(coordinates[:, 1])]
+    _abcissa_min = coordinates[np.argmin(coordinates[:, 0])]
+    _ordinate_min = coordinates[np.argmin(coordinates[:, 1])]
+
+    #if extremum are outside rotation is cancelled
+    if _abcissa_max[0] > abscissaScale[1] - margin:
+        return False
+
+    if _ordinate_max[1] > ordinateScale[1] - margin:
+        return False
+
+    if _abcissa_min[0] < abscissaScale[0] + margin:
+        return False
+
+    if _ordinate_min[1] < ordinateScale[0] + margin:
+        return False
+
+    return True   
+
+def random_rotation(x, y, rg, fill_mode="nearest", cval=0., y_abscissaScale=(-1,1), y_ordinateScale=(-1,1), margin=0):
     angle = random.uniform(-rg, rg)
+
+    _y = None
+
+    if y is not None:
+        #@see https://en.wikipedia.org/wiki/Rotation_matrix
+        _y = np.transpose(np.dot(np.array([ [cos(radians(-angle)), -sin(radians(-angle))], [sin(radians(-angle)), cos(radians(-angle))] ]), np.transpose(y)))
+
+        if not coordinatesToLearnAreStillInScope(_y, y_abscissaScale, y_ordinateScale, margin):
+            return (x,y)
+
     x = ndimage.interpolation.rotate(x, angle,
                                      axes=(1, 2),
                                      reshape=False,
                                      mode=fill_mode,
                                      cval=cval)
-    return x
+    return (x,_y)
 
 
-def random_shift(x, wrg, hrg, fill_mode="nearest", cval=0.):
+
+
+def random_shift(x, y, wrg, hrg, fill_mode="nearest", cval=0., y_abscissaScale=(-1,1), y_ordinateScale=(-1,1), margin=0):
     crop_left_pixels = 0
     crop_top_pixels = 0
+    _y = None
 
     if wrg:
         crop = random.uniform(0., wrg)
         split = random.uniform(0, 1)
         crop_left_pixels = int(split*crop*x.shape[1])
+
     if hrg:
         crop = random.uniform(0., hrg)
         split = random.uniform(0, 1)
         crop_top_pixels = int(split*crop*x.shape[2])
+
+    if y is not None:
+        _y = np.add(y, [[crop_top_pixels/float(x.shape[2]) * (y_ordinateScale[1] - y_ordinateScale[0]), crop_left_pixels/float(x.shape[1]) * (y_abscissaScale[1] - y_abscissaScale[0])]])
+
+        if not coordinatesToLearnAreStillInScope(_y, y_abscissaScale, y_ordinateScale, margin):
+            return (x,y)
+
     x = ndimage.interpolation.shift(x, (0, crop_left_pixels, crop_top_pixels),
                                     order=0,
                                     mode=fill_mode,
                                     cval=cval)
-    return x
+    return (x,_y)
 
 
-def horizontal_flip(x):
+
+def horizontal_flip(x,y, swapingIndex=[]):
+    if y is not None:
+        y[:,0] = y[:,0] * -1.0
+
+        for (i,j) in swapingIndex:
+            _temp = np.copy(y[i])
+            y[i] = y[j]
+            y[j] = _temp
+        
     for i in range(x.shape[0]):
         x[i] = np.fliplr(x[i])
-    return x
+    return (x,y)
 
 
-def vertical_flip(x):
+def vertical_flip(x,y, swapingIndex=[]):
+    if y is not None:
+        y[:,1] = y[:,1] * -1.0
+
+        for (i,j) in swapingIndex:
+            _temp = np.copy(y[i])
+            y[i] = y[j]
+            y[j] = _temp
+        
     for i in range(x.shape[0]):
-        x[i] = np.flipud(x[i])
-    return x
+        x[i] = np.fliplr(x[i])
+    return (x,y)
 
 
 def random_barrel_transform(x, intensity):
@@ -89,8 +151,9 @@ def random_zoom(x, rg, fill_mode="nearest", cval=0.):
     return x  # shape of result will be different from shape of input!
 
 
-def array_to_img(x, scale=True):
-    from PIL import Image
+def array_to_img(x, y=None, scale=True):
+    from PIL import Image, ImageDraw
+
     x = x.transpose(1, 2, 0)
     if scale:
         x += max(-np.min(x), 0)
@@ -98,10 +161,20 @@ def array_to_img(x, scale=True):
         x *= 255
     if x.shape[2] == 3:
         # RGB
-        return Image.fromarray(x.astype("uint8"), "RGB")
+        image = Image.fromarray(x.astype("uint8"), "RGB")
     else:
         # grayscale
-        return Image.fromarray(x[:, :, 0].astype("uint8"), "L")
+        image = Image.fromarray(x[:, :, 0].astype("uint8"), "L")
+
+    if y is not None:
+        y = y.reshape(-1,2)
+        y[:,0] *=  x.shape[0]/2
+        y[:,0] +=  x.shape[0]/2
+        y[:,1] *=  x.shape[1]/2
+        y[:,1] +=  x.shape[1]/2
+        ImageDraw.Draw(image).point(map(tuple, y ))
+
+    return image
 
 
 def img_to_array(img):
@@ -180,7 +253,12 @@ class ImageDataGenerator(object):
             yield index_array[current_index: current_index + current_batch_size], current_index, current_batch_size
 
     def flow(self, X, y, batch_size=32, shuffle=False, seed=None,
-             save_to_dir=None, save_prefix="", save_format="jpeg"):
+             save_to_dir=None, save_prefix="", save_format="jpeg", horizontalSwapingIndex = None, verticalSwapingIndex = None):
+        '''If you want to also change y value during random_transform, y must have (_,2) shaped and be normalized between [-1;1]
+        For now only shift, rotation and flip change y values.
+        horizontalSwaping is used to swap y indexes (to handle leftmost/rightmost)
+        verticalSwaping is used to swap y indexes (to handle upper/lower)
+        '''
         assert len(X) == len(y)
         self.X = X
         self.y = y
@@ -188,6 +266,8 @@ class ImageDataGenerator(object):
         self.save_prefix = save_prefix
         self.save_format = save_format
         self.flow_generator = self._flow_index(X.shape[0], batch_size, shuffle, seed)
+        self.horizontalSwaping = horizontalSwapingIndex
+        self.verticalSwaping = verticalSwapingIndex
         return self
 
     def __iter__(self):
@@ -202,16 +282,30 @@ class ImageDataGenerator(object):
             index_array, current_index, current_batch_size = next(self.flow_generator)
         # The transformation of images is not under thread lock so it can be done in parallel
         bX = np.zeros(tuple([current_batch_size] + list(self.X.shape)[1:]))
-        for i, j in enumerate(index_array):
-            x = self.X[j]
-            x = self.random_transform(x.astype("float32"))
-            x = self.standardize(x)
-            bX[i] = x
+        bY = np.zeros((current_batch_size, len(self.y[0].flatten())))
+
+        #test if data to learn from are coordinates that need to be transformed with raw image
+        if self.y[0].ndim == 2:
+            for i, j in enumerate(index_array):
+                x = self.X[j]
+                x, bY[i] = self.random_transform(x.astype("float32"), self.y[j])
+                x = self.standardize(x)
+                bX[i] = x
+        else:
+            for i, j in enumerate(index_array):
+                x = self.X[j]
+                x, _ = self.random_transform(x.astype("float32"))
+                x = self.standardize(x)
+                bX[i] = x           
         if self.save_to_dir:
-            for i in range(current_batch_size):
-                img = array_to_img(bX[i], scale=True)
-                img.save(self.save_to_dir + "/" + self.save_prefix + "_" + str(current_index + i) + "." + self.save_format)
-        bY = self.y[index_array]
+            if self.y[0].ndim == 2:
+                for i in range(current_batch_size):
+                    img = array_to_img(bX[i], bY[i], scale=True)
+                    img.save(self.save_to_dir + "/" + self.save_prefix + "_" + str(current_index + i) + "." + self.save_format)
+            else:
+                for i in range(current_batch_size):
+                    img = array_to_img(bX[i], scale=True)
+                    img.save(self.save_to_dir + "/" + self.save_prefix + "_" + str(current_index + i) + "." + self.save_format)
         return bX, bY
 
     def __next__(self):
@@ -236,17 +330,17 @@ class ImageDataGenerator(object):
 
         return x
 
-    def random_transform(self, x):
+    def random_transform(self, x, y = None):
         if self.rotation_range:
-            x = random_rotation(x, self.rotation_range)
+            x, y = random_rotation(x, y, self.rotation_range)
         if self.width_shift_range or self.height_shift_range:
-            x = random_shift(x, self.width_shift_range, self.height_shift_range)
+            x, y = random_shift(x, y, self.width_shift_range, self.height_shift_range)
         if self.horizontal_flip:
             if random.random() < 0.5:
-                x = horizontal_flip(x)
+                x, y = horizontal_flip(x, y, self.horizontalSwaping)
         if self.vertical_flip:
             if random.random() < 0.5:
-                x = vertical_flip(x)
+                x, y = vertical_flip(x, y, self.verticalSwaping)
         if self.shear_range:
             x = random_shear(x,self.shear_range)
         # TODO:
@@ -254,7 +348,10 @@ class ImageDataGenerator(object):
         # barrel/fisheye
         # shearing
         # channel shifting
-        return x
+        if y is None:
+            return (x, None)
+        else:
+            return (x, y.flatten())
 
     def fit(self, X,
             augment=False,  # fit on randomly augmented samples
